@@ -11,7 +11,7 @@ import (
 var (
 	ErrInvalidDuration = errors.New("invalid duration")
 	ErrClipOutside     = errors.New("clip zone is outside video")
-	ErrTruncatedChunk  = errors.New("chunk was truncted")
+	ErrTruncatedChunk  = errors.New("chunk was truncated")
 )
 
 type chunk struct {
@@ -272,7 +272,6 @@ func (f *clipFilter) updateChunks(tnum int, t *TrakBox) {
 			firstChunk = c
 			firstIndex = index
 		}
-		log.Printf("track %d, chunk #%d => %d samples\n", c.track, c.index, len(c.samples))
 		if len(c.samples) != len(firstChunk.samples) || c.descriptionID != firstChunk.descriptionID {
 			stsc.FirstChunk = append(stsc.FirstChunk, firstIndex)
 			stsc.SamplesPerChunk = append(stsc.SamplesPerChunk, uint32(len(firstChunk.samples)))
@@ -351,7 +350,7 @@ func (f *clipFilter) FilterMdat(w io.Writer, m *MdatBox) error {
 	buffer := make([]byte, bufSize)
 	for _, c := range f.chunks {
 		s := c.size()
-		n, err := m.r.Read(buffer[:s])
+		n, err := io.ReadFull(m.r, buffer[:s])
 		if err != nil {
 			return err
 		}

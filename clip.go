@@ -22,6 +22,7 @@ type chunk struct {
 	oldOffset               uint32
 	samples                 []uint32
 	firstSample, lastSample uint32
+	keyFrame                bool
 	skip                    bool
 }
 
@@ -101,6 +102,9 @@ func (f *clipFilter) FilterMoov(m *MoovBox) error {
 	f.chunks = []*chunk{}
 	for tnum, t := range m.Trak {
 		f.buildChunkList(tnum, t)
+	}
+	f.syncToKF()
+	for tnum, t := range m.Trak {
 		// update stts, find first/last sample
 		f.updateSamples(tnum, t)
 		f.updateChunks(tnum, t)
@@ -113,11 +117,21 @@ func (f *clipFilter) FilterMoov(m *MoovBox) error {
 		for _, ssz := range c.samples {
 			sz += int(ssz)
 		}
-		log.Printf("chunk %d/track %d (offset %d, size %d)\n", c.index, c.track, c.oldOffset, sz)
 	}
 	deltaOffset := m.Size() - oldSize
 	f.mdatSize = f.updateChunkOffsets(m, deltaOffset)
 	return nil
+}
+
+func (f *clipFilter) syncToKF() {
+	var tc time.Duration
+	for _, c := range f.chunks {
+		if c.keyFrame && c.firstTC <= f.begin {
+			tc = c.firstTC
+		}
+	}
+	f.end += f.begin - tc
+	f.begin = tc
 }
 
 func (f *clipFilter) buildChunkList(tnum int, t *TrakBox) {
@@ -125,8 +139,9 @@ func (f *clipFilter) buildChunkList(tnum int, t *TrakBox) {
 	stsc := t.Mdia.Minf.Stbl.Stsc
 	stco := t.Mdia.Minf.Stbl.Stco
 	stts := t.Mdia.Minf.Stbl.Stts
+	stss := t.Mdia.Minf.Stbl.Stss
 	timescale := t.Mdia.Mdhd.Timescale
-	sci, ssi := 0, 0
+	sci, ssi, ski := 0, 0, 0
 	for i, off := range stco.ChunkOffset {
 		c := &chunk{
 			track:       tnum,
@@ -142,12 +157,18 @@ func (f *clipFilter) buildChunkList(tnum int, t *TrakBox) {
 		c.descriptionID = stsc.SampleDescriptionID[sci]
 		samples := stsc.SamplesPerChunk[sci]
 		for samples > 0 {
-			c.samples = append(c.samples, stsz.GetSampleSize(ssi))
+			c.samples = append(c.samples, stsz.GetSampleSize(ssi+1))
 			ssi++
 			samples--
 		}
-		c.lastSample = uint32(ssi + 1)
+		c.lastSample = uint32(ssi)
 		c.lastTC = stts.GetTimeCode(c.lastSample, timescale)
+		if stss != nil {
+			for ski < len(stss.SampleNumber) && stss.SampleNumber[ski] < c.lastSample {
+				c.keyFrame = true
+				ski++
+			}
+		}
 		f.chunks = append(f.chunks, c)
 	}
 }
@@ -161,23 +182,26 @@ func (f *clipFilter) updateSamples(tnum int, t *TrakBox) {
 	firstSample := f.chunks.firstSample(tnum, f.begin)
 	lastSample := f.chunks.lastSample(tnum, f.end)
 
-	//FIXME : compute real duration
-	var sample uint32
+	log.Printf("first sample %d, last %d", firstSample, lastSample)
+	sample := uint32(1)
 	for i := 0; i < len(oldCount) && sample < lastSample; i++ {
 		if sample+oldCount[i] >= firstSample {
-			current := oldCount[i]
-			if sample < firstSample && sample+oldCount[i] > firstSample {
-				current += sample - firstSample
-			}
-			if sample+oldCount[i] > lastSample {
-				current += lastSample - sample - oldCount[i]
+			var current uint32
+			switch {
+			case sample < firstSample && sample+oldCount[i] > lastSample:
+				current = lastSample - firstSample + 1
+			case sample < firstSample:
+				current = oldCount[i] + sample - firstSample
+			case sample+oldCount[i] > lastSample:
+				current = oldCount[i] + sample - lastSample
+			default:
+				current = oldCount[i]
 			}
 			stts.SampleCount = append(stts.SampleCount, current)
 			stts.SampleTimeDelta = append(stts.SampleTimeDelta, oldDelta[i])
 		}
 		sample += oldCount[i]
 	}
-	log.Printf("first : %d, last : %d (trak %d)", firstSample, lastSample, tnum)
 
 	// stss (key frames)
 	stss := t.Mdia.Minf.Stbl.Stss
@@ -200,13 +224,14 @@ func (f *clipFilter) updateSamples(tnum int, t *TrakBox) {
 			stsz.SampleSize = append(stsz.SampleSize, sz)
 		}
 	}
+	log.Printf("stsz => %d", len(stsz.SampleSize))
 
 	// ctts - time offsets
 	ctts := t.Mdia.Minf.Stbl.Ctts
 	if ctts != nil {
 		oldCount, oldOffset := ctts.SampleCount, ctts.SampleOffset
 		ctts.SampleCount, ctts.SampleOffset = []uint32{}, []uint32{}
-		var sample uint32
+		sample := uint32(1)
 		for i := 0; i < len(oldCount) && sample < lastSample; i++ {
 			if sample+oldCount[i] >= firstSample {
 				current := oldCount[i]
@@ -231,26 +256,34 @@ func (f *clipFilter) updateChunks(tnum int, t *TrakBox) {
 	stsc := t.Mdia.Minf.Stbl.Stsc
 	stsc.FirstChunk, stsc.SamplesPerChunk, stsc.SampleDescriptionID = []uint32{}, []uint32{}, []uint32{}
 	var firstChunk *chunk
-	var index uint32
+	var index, firstIndex uint32
+	firstSample := f.chunks.firstSample(tnum, f.begin)
+	lastSample := f.chunks.lastSample(tnum, f.end)
 	for _, c := range f.chunks {
 		if c.track != tnum {
 			continue
 		}
-		if c.firstTC > f.end || c.lastTC < f.begin {
+		if c.firstSample > lastSample || c.lastSample < firstSample {
 			c.skip = true
 			continue
 		}
 		index++
 		if firstChunk == nil {
 			firstChunk = c
+			firstIndex = index
 		}
-		if index == 1 || len(c.samples) != len(firstChunk.samples) || c.descriptionID != firstChunk.descriptionID {
-			stsc.FirstChunk = append(stsc.FirstChunk, index)
+		log.Printf("track %d, chunk #%d => %d samples\n", c.track, c.index, len(c.samples))
+		if len(c.samples) != len(firstChunk.samples) || c.descriptionID != firstChunk.descriptionID {
+			stsc.FirstChunk = append(stsc.FirstChunk, firstIndex)
 			stsc.SamplesPerChunk = append(stsc.SamplesPerChunk, uint32(len(firstChunk.samples)))
 			stsc.SampleDescriptionID = append(stsc.SampleDescriptionID, firstChunk.descriptionID)
 			firstChunk = c
+			firstIndex = index
 		}
 	}
+	stsc.FirstChunk = append(stsc.FirstChunk, firstIndex)
+	stsc.SamplesPerChunk = append(stsc.SamplesPerChunk, uint32(len(firstChunk.samples)))
+	stsc.SampleDescriptionID = append(stsc.SampleDescriptionID, firstChunk.descriptionID)
 
 	// stco (chunk offsets) - build empty table to compute moov box size
 	stco := t.Mdia.Minf.Stbl.Stco
@@ -333,8 +366,6 @@ func (f *clipFilter) FilterMdat(w io.Writer, m *MdatBox) error {
 			if n != int(s) {
 				return ErrTruncatedChunk
 			}
-		} else {
-			log.Printf("skipping chunk %d (track %d)\n", c.index, c.track)
 		}
 	}
 	return nil

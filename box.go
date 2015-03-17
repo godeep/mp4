@@ -979,6 +979,7 @@ func (b *StblBox) Size() int {
 func (b *StblBox) Dump() {
 	b.Stsc.Dump()
 	b.Stts.Dump()
+	b.Stsz.Dump()
 	if b.Stss != nil {
 		b.Stss.Dump()
 	}
@@ -1237,7 +1238,7 @@ func (b *StscBox) Size() int {
 func (b *StscBox) Dump() {
 	fmt.Println("Sample to Chunk:")
 	for i := range b.SamplesPerChunk {
-		fmt.Printf(" #%d : %d samples starting @chunk #%d \n", i, b.SamplesPerChunk[i], b.FirstChunk[i])
+		fmt.Printf(" #%d : %d samples per chunk starting @chunk #%d \n", i, b.SamplesPerChunk[i], b.FirstChunk[i])
 	}
 }
 
@@ -1296,11 +1297,19 @@ func (b *StszBox) Size() int {
 	return BoxHeaderSize + 12 + len(b.SampleSize)*4
 }
 
+func (b *StszBox) Dump() {
+	if len(b.SampleSize) == 0 {
+		fmt.Printf("Samples : %d total samples\n", b.SampleNumber)
+	} else {
+		fmt.Printf("Samples : %d total samples\n", len(b.SampleSize))
+	}
+}
+
 func (b *StszBox) GetSampleSize(i int) uint32 {
-	if i >= len(b.SampleSize) {
+	if i > len(b.SampleSize) {
 		return b.SampleUniformSize
 	}
-	return b.SampleSize[i]
+	return b.SampleSize[i-1]
 }
 
 func (b *StszBox) Encode(w io.Writer) error {

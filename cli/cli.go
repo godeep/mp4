@@ -28,8 +28,7 @@ func main() {
 		if *start > 0 {
 			v.EncodeFiltered(fd, mp4.Clip(*start, *duration))
 		} else {
-			//v.EncodeFiltered(fd, mp4.Noop())
-			v.EncodeFiltered(fd, mp4.Clip(*start, *duration))
+			v.EncodeFiltered(fd, mp4.Noop())
 		}
 	}
 }

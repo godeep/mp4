@@ -7,14 +7,17 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"time"
 )
 
 const (
-	BOX_HEADER_SIZE = 8
+	BoxHeaderSize = 8
 )
 
 var (
-	ErrUnknownBoxType = errors.New("unknown box type")
+	ErrUnknownBoxType  = errors.New("unknown box type")
+	ErrTruncatedHeader = errors.New("truncated header")
+	ErrBadFormat       = errors.New("bad format")
 )
 
 var decoders map[string]BoxDecoder
@@ -47,25 +50,38 @@ func init() {
 		"stts": DecodeStts,
 		"stss": DecodeStss,
 		"meta": DecodeMeta,
+		"mdat": DecodeMdat,
 	}
 }
 
 type BoxHeader struct {
 	Type string
-	Size int64
+	Size uint32
 }
 
-func (h BoxHeader) Encode(w io.Writer) error {
-	buf := make([]byte, BOX_HEADER_SIZE)
-	binary.BigEndian.PutUint32(buf, uint32(h.Size))
-	strtobuf(buf[4:], h.Type, 4)
+func DecodeHeader(r io.Reader) (BoxHeader, error) {
+	buf := make([]byte, BoxHeaderSize)
+	n, err := r.Read(buf)
+	if err != nil {
+		return BoxHeader{}, err
+	}
+	if n != BoxHeaderSize {
+		return BoxHeader{}, ErrTruncatedHeader
+	}
+	return BoxHeader{string(buf[4:8]), binary.BigEndian.Uint32(buf[0:4])}, nil
+}
+
+func EncodeHeader(b Box, w io.Writer) error {
+	buf := make([]byte, BoxHeaderSize)
+	binary.BigEndian.PutUint32(buf, uint32(b.Size()))
+	strtobuf(buf[4:], b.Type(), 4)
 	_, err := w.Write(buf)
 	return err
 }
 
 type Box interface {
-	SetHeader(BoxHeader)
-	Header() BoxHeader
+	Type() string
+	Size() int
 }
 
 type BoxDecoder func(r io.Reader) (Box, error)
@@ -74,14 +90,14 @@ func DecodeBox(h BoxHeader, r io.Reader) (Box, error) {
 	fmt.Printf("Found %s with size %d\n", h.Type, h.Size)
 	d := decoders[h.Type]
 	if d == nil {
-		log.Printf("Error : %s unknown", h.Type)
+		log.Printf("Error while decoding %s : unknown box type", h.Type)
 		return nil, ErrUnknownBoxType
 	}
-	b, err := d(io.LimitReader(r, h.Size-int64(BOX_HEADER_SIZE)))
+	b, err := d(io.LimitReader(r, int64(h.Size-BoxHeaderSize)))
 	if err != nil {
+		log.Printf("Error while decoding %s : %s", h.Type, err)
 		return nil, err
 	}
-	b.SetHeader(h)
 	return b, nil
 }
 
@@ -103,22 +119,9 @@ func DecodeContainer(r io.Reader) ([]Box, error) {
 	}
 }
 
-type BaseBox struct {
-	h BoxHeader
-}
-
-func (b *BaseBox) SetHeader(h BoxHeader) {
-	b.h = h
-}
-
-func (b *BaseBox) Header() BoxHeader {
-	return b.h
-}
-
 type FtypBox struct {
-	BaseBox
 	MajorBrand       string
-	MinorVersion     string
+	MinorVersion     []byte
 	CompatibleBrands []string
 }
 
@@ -129,7 +132,7 @@ func DecodeFtyp(r io.Reader) (Box, error) {
 	}
 	b := &FtypBox{
 		MajorBrand:       string(data[0:4]),
-		MinorVersion:     string(data[4:8]),
+		MinorVersion:     data[4:8],
 		CompatibleBrands: []string{},
 	}
 	if len(data) > 8 {
@@ -140,18 +143,26 @@ func DecodeFtyp(r io.Reader) (Box, error) {
 	return b, nil
 }
 
+func (b *FtypBox) Type() string {
+	return "ftyp"
+}
+
+func (b *FtypBox) Size() int {
+	return BoxHeaderSize + 8 + 4*len(b.CompatibleBrands)
+}
+
 func (b *FtypBox) Dump() {
-	fmt.Printf("ftyp:\n MajorBrand: %s\n MinorVersion: %s\n CompatibleBrands: %v\n", b.MajorBrand, b.MinorVersion, b.CompatibleBrands)
+	fmt.Printf("File Type: %s\n", b.MajorBrand)
 }
 
 func (b *FtypBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+4*len(b.CompatibleBrands))
+	buf := makebuf(b)
 	strtobuf(buf, b.MajorBrand, 4)
-	strtobuf(buf[4:], b.MinorVersion, 4)
+	copy(buf[4:], b.MinorVersion)
 	for i, c := range b.CompatibleBrands {
 		strtobuf(buf[8+i*4:], c, 4)
 	}
@@ -160,7 +171,6 @@ func (b *FtypBox) Encode(w io.Writer) error {
 }
 
 type MoovBox struct {
-	BaseBox
 	Mvhd *MvhdBox
 	Iods *IodsBox
 	Trak []*TrakBox
@@ -169,9 +179,12 @@ type MoovBox struct {
 
 func DecodeMoov(r io.Reader) (Box, error) {
 	l, err := DecodeContainer(r)
+	if err != nil {
+		return nil, err
+	}
 	m := &MoovBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "mvhd":
 			m.Mvhd = b.(*MvhdBox)
 		case "iods":
@@ -187,13 +200,30 @@ func DecodeMoov(r io.Reader) (Box, error) {
 	return m, err
 }
 
+func (b *MoovBox) Type() string {
+	return "moov"
+}
+
+func (b *MoovBox) Size() int {
+	sz := b.Mvhd.Size()
+	sz += b.Iods.Size()
+	for _, t := range b.Trak {
+		sz += t.Size()
+	}
+	sz += b.Udta.Size()
+	return sz + BoxHeaderSize
+}
+
 func (b *MoovBox) Dump() {
-	fmt.Println("moov:")
 	b.Mvhd.Dump()
+	for i, t := range b.Trak {
+		fmt.Println("Track", i)
+		t.Dump()
+	}
 }
 
 func (b *MoovBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -215,8 +245,7 @@ func (b *MoovBox) Encode(w io.Writer) error {
 }
 
 type MvhdBox struct {
-	BaseBox
-	Version          uint8
+	Version          byte
 	Flags            [3]byte
 	CreationTime     uint32
 	ModificationTime uint32
@@ -225,7 +254,7 @@ type MvhdBox struct {
 	NextTrackId      uint32
 	Rate             Fixed32
 	Volume           Fixed16
-	otherData        []byte
+	notDecoded       []byte
 }
 
 func DecodeMvhd(r io.Reader) (Box, error) {
@@ -233,37 +262,38 @@ func DecodeMvhd(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &MvhdBox{
+	return &MvhdBox{
 		Version:          data[0],
 		Flags:            [3]byte{data[1], data[2], data[3]},
 		CreationTime:     binary.BigEndian.Uint32(data[4:8]),
 		ModificationTime: binary.BigEndian.Uint32(data[8:12]),
 		Timescale:        binary.BigEndian.Uint32(data[12:16]),
 		Duration:         binary.BigEndian.Uint32(data[16:20]),
-		otherData:        data[26:],
-	}
-	b.Rate, err = MakeFixed32(data[20:24])
-	if err != nil {
-		return nil, err
-	}
-	b.Volume, err = MakeFixed16(data[24:26])
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+		Rate:             fixed32(data[20:24]),
+		Volume:           fixed16(data[24:26]),
+		notDecoded:       data[26:],
+	}, nil
+}
+
+func (b *MvhdBox) Type() string {
+	return "mvhd"
+}
+
+func (b *MvhdBox) Size() int {
+	return BoxHeaderSize + 26 + len(b.notDecoded)
 }
 
 func (b *MvhdBox) Dump() {
-	fmt.Printf("mvhd:\n Timescale: %d\n Duration: %d\n Rate: %s\n Volume: %s\n", b.Timescale, b.Duration, b.Rate, b.Volume)
+	fmt.Printf("Movie Header:\n Timescale: %d units/sec\n Duration: %d units (%s)\n Rate: %s\n Volume: %s\n", b.Timescale, b.Duration, time.Duration(b.Duration/b.Timescale)*time.Second, b.Rate, b.Volume)
 }
 
 func (b *MvhdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 26)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint32(buf[4:], b.CreationTime)
 	binary.BigEndian.PutUint32(buf[8:], b.ModificationTime)
@@ -271,14 +301,13 @@ func (b *MvhdBox) Encode(w io.Writer) error {
 	binary.BigEndian.PutUint32(buf[16:], b.Duration)
 	binary.BigEndian.PutUint32(buf[20:], uint32(b.Rate))
 	binary.BigEndian.PutUint16(buf[24:], uint16(b.Volume))
-	buf = append(buf, b.otherData...)
+	copy(buf[26:], b.notDecoded)
 	_, err = w.Write(buf)
 	return err
 }
 
 type IodsBox struct {
-	BaseBox
-	data []byte
+	notDecoded []byte
 }
 
 func DecodeIods(r io.Reader) (Box, error) {
@@ -286,27 +315,29 @@ func DecodeIods(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &IodsBox{
-		data: data,
-	}
-	return b, nil
+	return &IodsBox{
+		notDecoded: data,
+	}, nil
 }
 
-func (b *IodsBox) Dump() {
-	fmt.Printf("iods:\n")
+func (b *IodsBox) Type() string {
+	return "iods"
+}
+
+func (b *IodsBox) Size() int {
+	return BoxHeaderSize + len(b.notDecoded)
 }
 
 func (b *IodsBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(b.data)
+	_, err = w.Write(b.notDecoded)
 	return err
 }
 
 type TrakBox struct {
-	BaseBox
 	Tkhd *TkhdBox
 	Mdia *MdiaBox
 	Edts *EdtsBox
@@ -319,7 +350,7 @@ func DecodeTrak(r io.Reader) (Box, error) {
 	}
 	t := &TrakBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "tkhd":
 			t.Tkhd = b.(*TkhdBox)
 		case "mdia":
@@ -333,12 +364,29 @@ func DecodeTrak(r io.Reader) (Box, error) {
 	return t, nil
 }
 
+func (b *TrakBox) Type() string {
+	return "trak"
+}
+
+func (b *TrakBox) Size() int {
+	sz := b.Tkhd.Size()
+	sz += b.Mdia.Size()
+	if b.Edts != nil {
+		sz += b.Edts.Size()
+	}
+	return sz + BoxHeaderSize
+}
+
 func (b *TrakBox) Dump() {
-	fmt.Println("trak:")
+	b.Tkhd.Dump()
+	if b.Edts != nil {
+		b.Edts.Dump()
+	}
+	b.Mdia.Dump()
 }
 
 func (b *TrakBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -356,8 +404,7 @@ func (b *TrakBox) Encode(w io.Writer) error {
 }
 
 type TkhdBox struct {
-	BaseBox
-	Version          uint8
+	Version          byte
 	Flags            [3]byte
 	CreationTime     uint32
 	ModificationTime uint32
@@ -375,39 +422,37 @@ func DecodeTkhd(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &TkhdBox{
+	return &TkhdBox{
 		Version:          data[0],
 		Flags:            [3]byte{data[1], data[2], data[3]},
 		CreationTime:     binary.BigEndian.Uint32(data[4:8]),
 		ModificationTime: binary.BigEndian.Uint32(data[8:12]),
 		TrackId:          binary.BigEndian.Uint32(data[12:16]),
+		Volume:           fixed16(data[36:38]),
 		Duration:         binary.BigEndian.Uint32(data[20:24]),
 		Layer:            binary.BigEndian.Uint16(data[32:34]),
 		AlternateGroup:   binary.BigEndian.Uint16(data[34:36]),
 		Matrix:           data[40:76],
-	}
-	b.Volume, err = MakeFixed16(data[36:38])
-	if err != nil {
-		return nil, err
-	}
-	b.Width, err = MakeFixed32(data[76:80])
-	if err != nil {
-		return nil, err
-	}
-	b.Height, err = MakeFixed32(data[80:84])
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+		Width:            fixed32(data[76:80]),
+		Height:           fixed32(data[80:84]),
+	}, nil
+}
+
+func (b *TkhdBox) Type() string {
+	return "tkhd"
+}
+
+func (b *TkhdBox) Size() int {
+	return BoxHeaderSize + 84
 }
 
 func (b *TkhdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 84)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint32(buf[4:], b.CreationTime)
 	binary.BigEndian.PutUint32(buf[8:], b.ModificationTime)
@@ -415,16 +460,20 @@ func (b *TkhdBox) Encode(w io.Writer) error {
 	binary.BigEndian.PutUint32(buf[20:], b.Duration)
 	binary.BigEndian.PutUint16(buf[32:], b.Layer)
 	binary.BigEndian.PutUint16(buf[34:], b.AlternateGroup)
-	PutFixed16(buf[36:], b.Volume)
+	putFixed16(buf[36:], b.Volume)
 	copy(buf[40:], b.Matrix)
-	PutFixed32(buf[76:], b.Width)
-	PutFixed32(buf[80:], b.Height)
+	putFixed32(buf[76:], b.Width)
+	putFixed32(buf[80:], b.Height)
 	_, err = w.Write(buf)
 	return err
 }
 
+func (b *TkhdBox) Dump() {
+	fmt.Println("Track Header:")
+	fmt.Printf(" Duration: %d units\n WxH: %sx%s\n", b.Duration, b.Width, b.Height)
+}
+
 type EdtsBox struct {
-	BaseBox
 	Elst *ElstBox
 }
 
@@ -433,20 +482,32 @@ func DecodeEdts(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &EdtsBox{}
+	e := &EdtsBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "elst":
-			t.Elst = b.(*ElstBox)
+			e.Elst = b.(*ElstBox)
 		default:
 			return nil, ErrBadFormat
 		}
 	}
-	return t, nil
+	return e, nil
+}
+
+func (b *EdtsBox) Type() string {
+	return "edts"
+}
+
+func (b *EdtsBox) Size() int {
+	return BoxHeaderSize + b.Elst.Size()
+}
+
+func (b *EdtsBox) Dump() {
+	b.Elst.Dump()
 }
 
 func (b *EdtsBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -454,10 +515,8 @@ func (b *EdtsBox) Encode(w io.Writer) error {
 }
 
 type ElstBox struct {
-	BaseBox
-	Version                             uint8
+	Version                             byte
 	Flags                               [3]byte
-	EntryCount                          uint32
 	SegmentDuration, MediaTime          []uint32
 	MediaRateInteger, MediaRateFraction []uint16 // This should really be int16 but not sure how to parse
 }
@@ -470,13 +529,13 @@ func DecodeElst(r io.Reader) (Box, error) {
 	b := &ElstBox{
 		Version:           data[0],
 		Flags:             [3]byte{data[1], data[2], data[3]},
-		EntryCount:        binary.BigEndian.Uint32(data[4:8]),
 		SegmentDuration:   []uint32{},
 		MediaTime:         []uint32{},
 		MediaRateInteger:  []uint16{},
 		MediaRateFraction: []uint16{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		sd := binary.BigEndian.Uint32(data[(8 + 12*i):(12 + 12*i)])
 		mt := binary.BigEndian.Uint32(data[(12 + 12*i):(16 + 12*i)])
 		mri := binary.BigEndian.Uint16(data[(16 + 12*i):(18 + 12*i)])
@@ -489,16 +548,31 @@ func DecodeElst(r io.Reader) (Box, error) {
 	return b, nil
 }
 
+func (b *ElstBox) Type() string {
+	return "elst"
+}
+
+func (b *ElstBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.SegmentDuration)*12
+}
+
+func (b *ElstBox) Dump() {
+	fmt.Println("Segment Duration:")
+	for i, d := range b.SegmentDuration {
+		fmt.Printf(" #%d: %d units\n", i, d)
+	}
+}
+
 func (b *ElstBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*12))
-	buf[0] = byte(b.Version)
+	buf := make([]byte, b.Size()-BoxHeaderSize)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.SegmentDuration)))
+	for i := range b.SegmentDuration {
 		binary.BigEndian.PutUint32(buf[8+12*i:], b.SegmentDuration[i])
 		binary.BigEndian.PutUint32(buf[12+12*i:], b.MediaTime[i])
 		binary.BigEndian.PutUint16(buf[16+12*i:], b.MediaRateInteger[i])
@@ -509,7 +583,6 @@ func (b *ElstBox) Encode(w io.Writer) error {
 }
 
 type MdiaBox struct {
-	BaseBox
 	Mdhd *MdhdBox
 	Hdlr *HdlrBox
 	Minf *MinfBox
@@ -520,24 +593,40 @@ func DecodeMdia(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &MdiaBox{}
+	m := &MdiaBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "mdhd":
-			t.Mdhd = b.(*MdhdBox)
+			m.Mdhd = b.(*MdhdBox)
 		case "hdlr":
-			t.Hdlr = b.(*HdlrBox)
+			m.Hdlr = b.(*HdlrBox)
 		case "minf":
-			t.Minf = b.(*MinfBox)
+			m.Minf = b.(*MinfBox)
 		default:
 			return nil, ErrBadFormat
 		}
 	}
-	return t, nil
+	return m, nil
+}
+
+func (b *MdiaBox) Type() string {
+	return "mdia"
+}
+
+func (b *MdiaBox) Size() int {
+	sz := b.Mdhd.Size()
+	sz += b.Hdlr.Size()
+	sz += b.Minf.Size()
+	return sz + BoxHeaderSize
+}
+
+func (b *MdiaBox) Dump() {
+	b.Mdhd.Dump()
+	b.Minf.Dump()
 }
 
 func (b *MdiaBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -555,8 +644,7 @@ func (b *MdiaBox) Encode(w io.Writer) error {
 }
 
 type MdhdBox struct {
-	BaseBox
-	Version          uint8
+	Version          byte
 	Flags            [3]byte
 	CreationTime     uint32
 	ModificationTime uint32
@@ -570,7 +658,7 @@ func DecodeMdhd(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &MdhdBox{
+	return &MdhdBox{
 		Version:          data[0],
 		Flags:            [3]byte{data[1], data[2], data[3]},
 		CreationTime:     binary.BigEndian.Uint32(data[4:8]),
@@ -578,17 +666,29 @@ func DecodeMdhd(r io.Reader) (Box, error) {
 		Timescale:        binary.BigEndian.Uint32(data[12:16]),
 		Duration:         binary.BigEndian.Uint32(data[16:20]),
 		Language:         binary.BigEndian.Uint16(data[20:22]),
-	}
-	return b, nil
+	}, nil
+}
+
+func (b *MdhdBox) Type() string {
+	return "mdhd"
+}
+
+func (b *MdhdBox) Size() int {
+	return BoxHeaderSize + 24
+}
+
+func (b *MdhdBox) Dump() {
+	fmt.Printf("Media Header:\n Timescale: %d units/sec\n Duration: %d units (%s)\n", b.Timescale, b.Duration, time.Duration(b.Duration/b.Timescale)*time.Second)
+
 }
 
 func (b *MdhdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 24)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint32(buf[4:], b.CreationTime)
 	binary.BigEndian.PutUint32(buf[8:], b.ModificationTime)
@@ -600,8 +700,7 @@ func (b *MdhdBox) Encode(w io.Writer) error {
 }
 
 type HdlrBox struct {
-	BaseBox
-	Version     uint8
+	Version     byte
 	Flags       [3]byte
 	PreDefined  uint32
 	HandlerType string
@@ -613,23 +712,30 @@ func DecodeHdlr(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &HdlrBox{
+	return &HdlrBox{
 		Version:     data[0],
 		Flags:       [3]byte{data[1], data[2], data[3]},
 		PreDefined:  binary.BigEndian.Uint32(data[4:8]),
 		HandlerType: string(data[8:12]),
 		TrackName:   string(data[24:]),
-	}
-	return b, nil
+	}, nil
+}
+
+func (b *HdlrBox) Type() string {
+	return "hdlr"
+}
+
+func (b *HdlrBox) Size() int {
+	return BoxHeaderSize + 24 + len(b.TrackName)
 }
 
 func (b *HdlrBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 24+len(b.TrackName))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint32(buf[4:], b.PreDefined)
 	strtobuf(buf[8:], b.HandlerType, 4)
@@ -639,7 +745,6 @@ func (b *HdlrBox) Encode(w io.Writer) error {
 }
 
 type MinfBox struct {
-	BaseBox
 	Vmhd *VmhdBox
 	Smhd *SmhdBox
 	Stbl *StblBox
@@ -654,7 +759,7 @@ func DecodeMinf(r io.Reader) (Box, error) {
 	}
 	m := &MinfBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "vmhd":
 			m.Vmhd = b.(*VmhdBox)
 		case "smhd":
@@ -672,8 +777,32 @@ func DecodeMinf(r io.Reader) (Box, error) {
 	return m, nil
 }
 
+func (b *MinfBox) Type() string {
+	return "minf"
+}
+
+func (b *MinfBox) Size() int {
+	sz := 0
+	if b.Vmhd != nil {
+		sz += b.Vmhd.Size()
+	}
+	if b.Smhd != nil {
+		sz += b.Smhd.Size()
+	}
+	sz += b.Stbl.Size()
+	sz += b.Dinf.Size()
+	if b.Hdlr != nil {
+		sz += b.Hdlr.Size()
+	}
+	return sz + BoxHeaderSize
+}
+
+func (b *MinfBox) Dump() {
+	b.Stbl.Dump()
+}
+
 func (b *MinfBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -704,8 +833,7 @@ func (b *MinfBox) Encode(w io.Writer) error {
 }
 
 type VmhdBox struct {
-	BaseBox
-	Version      uint8
+	Version      byte
 	Flags        [3]byte
 	GraphicsMode uint16
 	OpColor      [3]uint16
@@ -727,13 +855,21 @@ func DecodeVmhd(r io.Reader) (Box, error) {
 	return b, nil
 }
 
+func (b *VmhdBox) Type() string {
+	return "vmhd"
+}
+
+func (b *VmhdBox) Size() int {
+	return BoxHeaderSize + 12
+}
+
 func (b *VmhdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 12)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint16(buf[4:], b.GraphicsMode)
 	for i := 0; i < 3; i++ {
@@ -744,8 +880,7 @@ func (b *VmhdBox) Encode(w io.Writer) error {
 }
 
 type SmhdBox struct {
-	BaseBox
-	Version uint8
+	Version byte
 	Flags   [3]byte
 	Balance uint16 // This should really be int16 but not sure how to parse
 }
@@ -755,21 +890,28 @@ func DecodeSmhd(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &SmhdBox{
+	return &SmhdBox{
 		Version: data[0],
 		Flags:   [3]byte{data[1], data[2], data[3]},
 		Balance: binary.BigEndian.Uint16(data[4:6]),
-	}
-	return b, nil
+	}, nil
+}
+
+func (b *SmhdBox) Type() string {
+	return "smhd"
+}
+
+func (b *SmhdBox) Size() int {
+	return BoxHeaderSize + 8
 }
 
 func (b *SmhdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint16(buf[4:], b.Balance)
 	_, err = w.Write(buf)
@@ -777,7 +919,6 @@ func (b *SmhdBox) Encode(w io.Writer) error {
 }
 
 type StblBox struct {
-	BaseBox
 	Stsd *StsdBox
 	Stts *SttsBox
 	Stss *StssBox
@@ -794,7 +935,7 @@ func DecodeStbl(r io.Reader) (Box, error) {
 	}
 	s := &StblBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "stsd":
 			s.Stsd = b.(*StsdBox)
 		case "stts":
@@ -816,8 +957,36 @@ func DecodeStbl(r io.Reader) (Box, error) {
 	return s, nil
 }
 
+func (b *StblBox) Type() string {
+	return "stbl"
+}
+
+func (b *StblBox) Size() int {
+	sz := b.Stsd.Size()
+	sz += b.Stts.Size()
+	if b.Stss != nil {
+		sz += b.Stss.Size()
+	}
+	sz += b.Stsc.Size()
+	sz += b.Stsz.Size()
+	sz += b.Stco.Size()
+	if b.Ctts != nil {
+		sz += b.Ctts.Size()
+	}
+	return sz + BoxHeaderSize
+}
+
+func (b *StblBox) Dump() {
+	b.Stsc.Dump()
+	b.Stts.Dump()
+	if b.Stss != nil {
+		b.Stss.Dump()
+	}
+	b.Stco.Dump()
+}
+
 func (b *StblBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -854,11 +1023,9 @@ func (b *StblBox) Encode(w io.Writer) error {
 }
 
 type StsdBox struct {
-	BaseBox
-	Version    uint8
+	Version    byte
 	Flags      [3]byte
-	EntryCount uint32
-	otherData  []byte
+	notDecoded []byte
 }
 
 func DecodeStsd(r io.Reader) (Box, error) {
@@ -866,36 +1033,39 @@ func DecodeStsd(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &StsdBox{
+	return &StsdBox{
 		Version:    data[0],
 		Flags:      [3]byte{data[1], data[2], data[3]},
-		EntryCount: binary.BigEndian.Uint32(data[4:8]),
-		otherData:  data[8:],
-	}
-	return b, nil
+		notDecoded: data[4:],
+	}, nil
+}
+
+func (b *StsdBox) Type() string {
+	return "stsd"
+}
+
+func (b *StsdBox) Size() int {
+	return BoxHeaderSize + 4 + len(b.notDecoded)
 }
 
 func (b *StsdBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+len(b.otherData))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	copy(buf[8:], b.otherData)
+	copy(buf[4:], b.notDecoded)
 	_, err = w.Write(buf)
 	return err
 }
 
 type SttsBox struct {
-	BaseBox
-	Version     uint8
-	Flags       [3]byte
-	EntryCount  uint32
-	SampleCount []uint32
-	SampleDelta []uint32
+	Version         byte
+	Flags           [3]byte
+	SampleCount     []uint32
+	SampleTimeDelta []uint32
 }
 
 func DecodeStts(r io.Reader) (Box, error) {
@@ -904,43 +1074,56 @@ func DecodeStts(r io.Reader) (Box, error) {
 		return nil, err
 	}
 	b := &SttsBox{
-		Version:     data[0],
-		Flags:       [3]byte{data[1], data[2], data[3]},
-		EntryCount:  binary.BigEndian.Uint32(data[4:8]),
-		SampleCount: []uint32{},
-		SampleDelta: []uint32{},
+		Version:         data[0],
+		Flags:           [3]byte{data[1], data[2], data[3]},
+		SampleCount:     []uint32{},
+		SampleTimeDelta: []uint32{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		s_count := binary.BigEndian.Uint32(data[(8 + 8*i):(12 + 8*i)])
 		s_delta := binary.BigEndian.Uint32(data[(12 + 8*i):(16 + 8*i)])
 		b.SampleCount = append(b.SampleCount, s_count)
-		b.SampleDelta = append(b.SampleDelta, s_delta)
+		b.SampleTimeDelta = append(b.SampleTimeDelta, s_delta)
 	}
 	return b, nil
 }
 
+func (b *SttsBox) Type() string {
+	return "stts"
+}
+
+func (b *SttsBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.SampleCount)*8
+}
+
+func (b *SttsBox) Dump() {
+	fmt.Println("Time to sample:")
+	for i := range b.SampleCount {
+		fmt.Printf(" #%d : %d samples with duration %d units\n", i, b.SampleCount[i], b.SampleTimeDelta[i])
+	}
+}
+
 func (b *SttsBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*8))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.SampleCount)))
+	for i := range b.SampleCount {
 		binary.BigEndian.PutUint32(buf[8+8*i:], b.SampleCount[i])
-		binary.BigEndian.PutUint32(buf[12+8*i:], b.SampleDelta[i])
+		binary.BigEndian.PutUint32(buf[12+8*i:], b.SampleTimeDelta[i])
 	}
 	_, err = w.Write(buf)
 	return err
 }
 
 type StssBox struct {
-	BaseBox
-	Version      uint8
+	Version      byte
 	Flags        [3]byte
-	EntryCount   uint32
 	SampleNumber []uint32
 }
 
@@ -952,26 +1135,41 @@ func DecodeStss(r io.Reader) (Box, error) {
 	b := &StssBox{
 		Version:      data[0],
 		Flags:        [3]byte{data[1], data[2], data[3]},
-		EntryCount:   binary.BigEndian.Uint32(data[4:8]),
 		SampleNumber: []uint32{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		sample := binary.BigEndian.Uint32(data[(8 + 4*i):(12 + 4*i)])
 		b.SampleNumber = append(b.SampleNumber, sample)
 	}
 	return b, nil
 }
 
+func (b *StssBox) Type() string {
+	return "stss"
+}
+
+func (b *StssBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.SampleNumber)*4
+}
+
+func (b *StssBox) Dump() {
+	fmt.Println("Key frames:")
+	for i, n := range b.SampleNumber {
+		fmt.Printf(" #%d : sample #%d\n", i, n)
+	}
+}
+
 func (b *StssBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*4))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.SampleNumber)))
+	for i := range b.SampleNumber {
 		binary.BigEndian.PutUint32(buf[8+4*i:], b.SampleNumber[i])
 	}
 	_, err = w.Write(buf)
@@ -979,13 +1177,11 @@ func (b *StssBox) Encode(w io.Writer) error {
 }
 
 type StscBox struct {
-	BaseBox
-	Version                uint8
-	Flags                  [3]byte
-	EntryCount             uint32
-	FirstChunk             []uint32
-	SamplesPerChunk        []uint32
-	SampleDescriptionIndex []uint32
+	Version             byte
+	Flags               [3]byte
+	FirstChunk          []uint32
+	SamplesPerChunk     []uint32
+	SampleDescriptionID []uint32
 }
 
 func DecodeStsc(r io.Reader) (Box, error) {
@@ -995,49 +1191,63 @@ func DecodeStsc(r io.Reader) (Box, error) {
 	}
 
 	b := &StscBox{
-		Version:                data[0],
-		Flags:                  [3]byte{data[1], data[2], data[3]},
-		EntryCount:             binary.BigEndian.Uint32(data[4:8]),
-		FirstChunk:             []uint32{},
-		SamplesPerChunk:        []uint32{},
-		SampleDescriptionIndex: []uint32{},
+		Version:             data[0],
+		Flags:               [3]byte{data[1], data[2], data[3]},
+		FirstChunk:          []uint32{},
+		SamplesPerChunk:     []uint32{},
+		SampleDescriptionID: []uint32{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		fc := binary.BigEndian.Uint32(data[(8 + 12*i):(12 + 12*i)])
 		spc := binary.BigEndian.Uint32(data[(12 + 12*i):(16 + 12*i)])
 		sdi := binary.BigEndian.Uint32(data[(16 + 12*i):(20 + 12*i)])
 		b.FirstChunk = append(b.FirstChunk, fc)
 		b.SamplesPerChunk = append(b.SamplesPerChunk, spc)
-		b.SampleDescriptionIndex = append(b.SampleDescriptionIndex, sdi)
+		b.SampleDescriptionID = append(b.SampleDescriptionID, sdi)
 	}
 	return b, nil
 }
 
+func (b *StscBox) Type() string {
+	return "stsc"
+}
+
+func (b *StscBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.FirstChunk)*12
+}
+
+func (b *StscBox) Dump() {
+	fmt.Println("Sample to Chunk:")
+	for i := range b.SamplesPerChunk {
+		fmt.Printf(" #%d : %d samples starting @chunk #%d \n", i, b.SamplesPerChunk[i], b.FirstChunk[i])
+	}
+}
+
 func (b *StscBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*12))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.FirstChunk)))
+	for i := range b.FirstChunk {
 		binary.BigEndian.PutUint32(buf[8+12*i:], b.FirstChunk[i])
 		binary.BigEndian.PutUint32(buf[12+12*i:], b.SamplesPerChunk[i])
-		binary.BigEndian.PutUint32(buf[16+12*i:], b.SampleDescriptionIndex[i])
+		binary.BigEndian.PutUint32(buf[16+12*i:], b.SampleDescriptionID[i])
 	}
 	_, err = w.Write(buf)
 	return err
 }
 
 type StszBox struct {
-	BaseBox
-	Version     uint8
-	Flags       [3]byte
-	SampleSize  uint32
-	SampleCount uint32
-	EntrySize   []uint32
+	Version           byte
+	Flags             [3]byte
+	SampleUniformSize uint32
+	SampleNumber      uint32
+	SampleSize        []uint32
 }
 
 func DecodeStsz(r io.Reader) (Box, error) {
@@ -1046,41 +1256,56 @@ func DecodeStsz(r io.Reader) (Box, error) {
 		return nil, err
 	}
 	b := &StszBox{
-		Version:     data[0],
-		Flags:       [3]byte{data[1], data[2], data[3]},
-		SampleSize:  binary.BigEndian.Uint32(data[4:8]),
-		SampleCount: binary.BigEndian.Uint32(data[8:12]),
-		EntrySize:   []uint32{},
+		Version:           data[0],
+		Flags:             [3]byte{data[1], data[2], data[3]},
+		SampleUniformSize: binary.BigEndian.Uint32(data[4:8]),
+		SampleNumber:      binary.BigEndian.Uint32(data[8:12]),
+		SampleSize:        []uint32{},
 	}
-	for i := 0; i < int(b.SampleCount); i++ {
-		entry := binary.BigEndian.Uint32(data[(12 + 4*i):(16 + 4*i)])
-		b.EntrySize = append(b.EntrySize, entry)
+	if len(data) > 12 {
+		for i := 0; i < int(b.SampleNumber); i++ {
+			sz := binary.BigEndian.Uint32(data[(12 + 4*i):(16 + 4*i)])
+			b.SampleSize = append(b.SampleSize, sz)
+		}
 	}
 	return b, nil
 }
 
+func (b *StszBox) Type() string {
+	return "stsz"
+}
+
+func (b *StszBox) Size() int {
+	return BoxHeaderSize + 12 + len(b.SampleSize)*4
+}
+
+func (b *StszBox) GetSampleSize(i int) uint32 {
+	if i >= len(b.SampleSize) {
+		return b.SampleUniformSize
+	}
+	return b.SampleSize[i]
+}
+
 func (b *StszBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 12+int(b.SampleCount*4))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.SampleSize)
-	binary.BigEndian.PutUint32(buf[8:], b.SampleCount)
-	for i := 0; i < int(b.SampleCount); i++ {
-		binary.BigEndian.PutUint32(buf[12+4*i:], b.EntrySize[i])
+	binary.BigEndian.PutUint32(buf[4:], b.SampleUniformSize)
+	binary.BigEndian.PutUint32(buf[8:], b.SampleNumber)
+	for i := range b.SampleSize {
+		binary.BigEndian.PutUint32(buf[12+4*i:], b.SampleSize[i])
 	}
 	_, err = w.Write(buf)
 	return err
 }
 
 type StcoBox struct {
-	BaseBox
-	Version     uint8
+	Version     byte
 	Flags       [3]byte
-	EntryCount  uint32
 	ChunkOffset []uint32
 }
 
@@ -1092,26 +1317,41 @@ func DecodeStco(r io.Reader) (Box, error) {
 	b := &StcoBox{
 		Version:     data[0],
 		Flags:       [3]byte{data[1], data[2], data[3]},
-		EntryCount:  binary.BigEndian.Uint32(data[4:8]),
 		ChunkOffset: []uint32{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		chunk := binary.BigEndian.Uint32(data[(8 + 4*i):(12 + 4*i)])
 		b.ChunkOffset = append(b.ChunkOffset, chunk)
 	}
 	return b, nil
 }
 
+func (b *StcoBox) Type() string {
+	return "stco"
+}
+
+func (b *StcoBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.ChunkOffset)*4
+}
+
+func (b *StcoBox) Dump() {
+	fmt.Println("Sample byte offsets:")
+	for i, o := range b.ChunkOffset {
+		fmt.Printf(" #%d : starts at %d\n", i, o)
+	}
+}
+
 func (b *StcoBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*4))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.ChunkOffset)))
+	for i := range b.ChunkOffset {
 		binary.BigEndian.PutUint32(buf[8+4*i:], b.ChunkOffset[i])
 	}
 	_, err = w.Write(buf)
@@ -1119,10 +1359,8 @@ func (b *StcoBox) Encode(w io.Writer) error {
 }
 
 type CttsBox struct {
-	BaseBox
-	Version      uint8
+	Version      byte
 	Flags        [3]byte
-	EntryCount   uint32
 	SampleCount  []uint32
 	SampleOffset []uint32
 }
@@ -1135,11 +1373,11 @@ func DecodeCtts(r io.Reader) (Box, error) {
 	b := &CttsBox{
 		Version:      data[0],
 		Flags:        [3]byte{data[1], data[2], data[3]},
-		EntryCount:   binary.BigEndian.Uint32(data[4:8]),
 		SampleCount:  []uint32{},
 		SampleOffset: []uint32{},
 	}
-	for i := 0; i < int(b.EntryCount); i++ {
+	ec := binary.BigEndian.Uint32(data[4:8])
+	for i := 0; i < int(ec); i++ {
 		s_count := binary.BigEndian.Uint32(data[(8 + 8*i):(12 + 8*i)])
 		s_offset := binary.BigEndian.Uint32(data[(12 + 8*i):(16 + 8*i)])
 		b.SampleCount = append(b.SampleCount, s_count)
@@ -1148,16 +1386,24 @@ func DecodeCtts(r io.Reader) (Box, error) {
 	return b, nil
 }
 
+func (b *CttsBox) Type() string {
+	return "ctts"
+}
+
+func (b *CttsBox) Size() int {
+	return BoxHeaderSize + 8 + len(b.SampleCount)*8
+}
+
 func (b *CttsBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+int(b.EntryCount*8))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	for i := 0; i < int(b.EntryCount); i++ {
+	binary.BigEndian.PutUint32(buf[4:], uint32(len(b.SampleCount)))
+	for i := range b.SampleCount {
 		binary.BigEndian.PutUint32(buf[8+8*i:], b.SampleCount[i])
 		binary.BigEndian.PutUint32(buf[12+8*i:], b.SampleOffset[i])
 	}
@@ -1166,7 +1412,6 @@ func (b *CttsBox) Encode(w io.Writer) error {
 }
 
 type DinfBox struct {
-	BaseBox
 	Dref *DrefBox
 }
 
@@ -1177,7 +1422,7 @@ func DecodeDinf(r io.Reader) (Box, error) {
 	}
 	d := &DinfBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "dref":
 			d.Dref = b.(*DrefBox)
 		default:
@@ -1187,8 +1432,16 @@ func DecodeDinf(r io.Reader) (Box, error) {
 	return d, nil
 }
 
+func (b *DinfBox) Type() string {
+	return "dinf"
+}
+
+func (b *DinfBox) Size() int {
+	return BoxHeaderSize + b.Dref.Size()
+}
+
 func (b *DinfBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
@@ -1196,11 +1449,9 @@ func (b *DinfBox) Encode(w io.Writer) error {
 }
 
 type DrefBox struct {
-	BaseBox
-	Version    uint8
+	Version    byte
 	Flags      [3]byte
-	EntryCount uint32
-	otherData  []byte
+	notDecoded []byte
 }
 
 func DecodeDref(r io.Reader) (Box, error) {
@@ -1208,31 +1459,35 @@ func DecodeDref(r io.Reader) (Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &DrefBox{
+	return &DrefBox{
 		Version:    data[0],
 		Flags:      [3]byte{data[1], data[2], data[3]},
-		EntryCount: binary.BigEndian.Uint32(data[4:8]),
-		otherData:  data[8:],
-	}
-	return b, nil
+		notDecoded: data[4:],
+	}, nil
+}
+
+func (b *DrefBox) Type() string {
+	return "dref"
+}
+
+func (b *DrefBox) Size() int {
+	return BoxHeaderSize + 4 + len(b.notDecoded)
 }
 
 func (b *DrefBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 8+len(b.otherData))
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
-	binary.BigEndian.PutUint32(buf[4:], b.EntryCount)
-	copy(buf[8:], b.otherData)
+	copy(buf[4:], b.notDecoded)
 	_, err = w.Write(buf)
 	return err
 }
 
 type UdtaBox struct {
-	BaseBox
 	Meta *MetaBox
 }
 
@@ -1243,7 +1498,7 @@ func DecodeUdta(r io.Reader) (Box, error) {
 	}
 	u := &UdtaBox{}
 	for _, b := range l {
-		switch b.Header().Type {
+		switch b.Type() {
 		case "meta":
 			u.Meta = b.(*MetaBox)
 		default:
@@ -1253,109 +1508,117 @@ func DecodeUdta(r io.Reader) (Box, error) {
 	return u, nil
 }
 
-func (b *UdtaBox) Dump() {
-	fmt.Printf("udta:\n")
+func (b *UdtaBox) Type() string {
+	return "udta"
+}
+
+func (b *UdtaBox) Size() int {
+	return BoxHeaderSize + b.Meta.Size()
 }
 
 func (b *UdtaBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	return err
+	return b.Meta.Encode(w)
 }
 
 type MetaBox struct {
-	BaseBox
-	Version uint8
-	Flags   [3]byte
-	Hdlr    *HdlrBox
+	Version    byte
+	Flags      [3]byte
+	notDecoded []byte
 }
 
 func DecodeMeta(r io.Reader) (Box, error) {
-	ioutil.ReadAll(r)
-	return &MetaBox{}, nil
+	data, err := ioutil.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return &MetaBox{
+		Version:    data[0],
+		Flags:      [3]byte{data[1], data[2], data[3]},
+		notDecoded: data[4:],
+	}, nil
 }
 
-/*
-func (b *MetaBox) parse() (err error) {
-	data := b.ReadBoxData()
-	b.Version = data[0]
-	b.Flags = [3]byte{data[1], data[2], data[3]}
-	boxes := readSubBoxes(b.File(), b.Start()+4, b.Size()-4)
-	for subBox := range boxes {
-		switch subBox.Name() {
-		case "hdlr":
-			b.hdlr = &HdlrBox{Box: subBox}
-			err = b.hdlr.parse()
-		default:
-			fmt.Printf("Unhandled Meta Sub-Box: %v \n", subBox.Name())
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+func (b *MetaBox) Type() string {
+	return "meta"
 }
-*/
+
+func (b *MetaBox) Size() int {
+	return BoxHeaderSize + 4 + len(b.notDecoded)
+}
+
 func (b *MetaBox) Encode(w io.Writer) error {
-	err := b.Header().Encode(w)
+	err := EncodeHeader(b, w)
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 4)
-	buf[0] = byte(b.Version)
+	buf := makebuf(b)
+	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
+	copy(buf[4:], b.notDecoded)
 	_, err = w.Write(buf)
-	b.Hdlr.Encode(w)
 	return err
 }
 
-// An 8.8 Fixed Point Decimal notation
+type MdatBox struct {
+	ContentSize uint32
+	r           io.Reader
+}
+
+func DecodeMdat(r io.Reader) (Box, error) {
+	return &MdatBox{r: r}, nil
+}
+
+func (b *MdatBox) Type() string {
+	return "mdat"
+}
+
+func (b *MdatBox) Size() int {
+	return BoxHeaderSize + int(b.ContentSize)
+}
+
+func (b *MdatBox) Encode(w io.Writer) error {
+	err := EncodeHeader(b, w)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, b.r)
+	return err
+}
+
+// An 8.8 fixed point number
 type Fixed16 uint16
 
 func (f Fixed16) String() string {
-	return fmt.Sprintf("%v", uint16(f)>>8)
+	return fmt.Sprintf("%d.%d", uint16(f)>>8, uint16(f)&7)
 }
 
-func MakeFixed16(bytes []byte) (Fixed16, error) {
-	if len(bytes) != 2 {
-		return Fixed16(0), errors.New("Invalid number of bytes for Fixed16. Need 2, got " + string(len(bytes)))
-	}
-	return Fixed16(binary.BigEndian.Uint16(bytes)), nil
+func fixed16(bytes []byte) Fixed16 {
+	return Fixed16(binary.BigEndian.Uint16(bytes))
 }
 
-func PutFixed16(bytes []byte, i Fixed16) {
+func putFixed16(bytes []byte, i Fixed16) {
 	binary.BigEndian.PutUint16(bytes, uint16(i))
 }
 
-// A 16.16 Fixed Point Decimal notation
+// A 16.16 fixed point number
 type Fixed32 uint32
 
 func (f Fixed32) String() string {
-	return fmt.Sprintf("%v", uint32(f)>>16)
+	return fmt.Sprintf("%d.%d", uint32(f)>>16, uint32(f)&15)
 }
 
-func MakeFixed32(bytes []byte) (Fixed32, error) {
-	if len(bytes) != 4 {
-		return Fixed32(0), errors.New("Invalid number of bytes for Fixed32. Need 4, got " + string(len(bytes)))
-	}
-	return Fixed32(binary.BigEndian.Uint32(bytes)), nil
+func fixed32(bytes []byte) Fixed32 {
+	return Fixed32(binary.BigEndian.Uint32(bytes))
 }
 
-func PutFixed32(bytes []byte, i Fixed32) {
+func putFixed32(bytes []byte, i Fixed32) {
 	binary.BigEndian.PutUint32(bytes, uint32(i))
 }
 
-/*
-type Chunk struct {
-	SampleDescriptionIndex, start_sample, SampleCount, offset uint32
-}
-
-type Sample struct {
-	size, offset, start_time, Duration, cto uint32
-}
-*/
 func strtobuf(out []byte, str string, l int) {
 	in := []byte(str)
 	if l < len(in) {
@@ -1363,4 +1626,8 @@ func strtobuf(out []byte, str string, l int) {
 	} else {
 		copy(out, in[0:l])
 	}
+}
+
+func makebuf(b Box) []byte {
+	return make([]byte, b.Size()-BoxHeaderSize)
 }

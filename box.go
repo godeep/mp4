@@ -1097,6 +1097,23 @@ func (b *SttsBox) Size() int {
 	return BoxHeaderSize + 8 + len(b.SampleCount)*8
 }
 
+func (b *SttsBox) GetTimeCode(sample, timescale uint32) time.Duration {
+	sample--
+	var units uint32
+	i := 0
+	for sample > 0 {
+		if sample >= b.SampleCount[i] {
+			units += b.SampleCount[i] * b.SampleTimeDelta[i]
+			sample -= b.SampleCount[i]
+		} else {
+			units += sample * b.SampleTimeDelta[i]
+			sample = 0
+		}
+		i++
+	}
+	return time.Second * time.Duration(units) / time.Duration(timescale)
+}
+
 func (b *SttsBox) Dump() {
 	fmt.Println("Time to sample:")
 	for i := range b.SampleCount {
@@ -1295,9 +1312,13 @@ func (b *StszBox) Encode(w io.Writer) error {
 	buf[0] = b.Version
 	buf[1], buf[2], buf[3] = b.Flags[0], b.Flags[1], b.Flags[2]
 	binary.BigEndian.PutUint32(buf[4:], b.SampleUniformSize)
-	binary.BigEndian.PutUint32(buf[8:], b.SampleNumber)
-	for i := range b.SampleSize {
-		binary.BigEndian.PutUint32(buf[12+4*i:], b.SampleSize[i])
+	if len(b.SampleSize) == 0 {
+		binary.BigEndian.PutUint32(buf[8:], b.SampleNumber)
+	} else {
+		binary.BigEndian.PutUint32(buf[8:], uint32(len(b.SampleSize)))
+		for i := range b.SampleSize {
+			binary.BigEndian.PutUint32(buf[12+4*i:], b.SampleSize[i])
+		}
 	}
 	_, err = w.Write(buf)
 	return err
@@ -1336,7 +1357,7 @@ func (b *StcoBox) Size() int {
 }
 
 func (b *StcoBox) Dump() {
-	fmt.Println("Sample byte offsets:")
+	fmt.Println("Chunk byte offsets:")
 	for i, o := range b.ChunkOffset {
 		fmt.Printf(" #%d : starts at %d\n", i, o)
 	}

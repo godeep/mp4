@@ -206,11 +206,15 @@ func (b *MoovBox) Type() string {
 
 func (b *MoovBox) Size() int {
 	sz := b.Mvhd.Size()
-	sz += b.Iods.Size()
+	if b.Iods != nil {
+		sz += b.Iods.Size()
+	}
 	for _, t := range b.Trak {
 		sz += t.Size()
 	}
-	sz += b.Udta.Size()
+	if b.Udta != nil {
+		sz += b.Udta.Size()
+	}
 	return sz + BoxHeaderSize
 }
 
@@ -231,9 +235,11 @@ func (b *MoovBox) Encode(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	err = b.Iods.Encode(w)
-	if err != nil {
-		return err
+	if b.Iods != nil {
+		err = b.Iods.Encode(w)
+		if err != nil {
+			return err
+		}
 	}
 	for _, t := range b.Trak {
 		err = t.Encode(w)
@@ -241,7 +247,10 @@ func (b *MoovBox) Encode(w io.Writer) error {
 			return err
 		}
 	}
-	return b.Udta.Encode(w)
+	if b.Udta != nil {
+		return b.Udta.Encode(w)
+	}
+	return nil
 }
 
 type MvhdBox struct {
@@ -615,14 +624,20 @@ func (b *MdiaBox) Type() string {
 
 func (b *MdiaBox) Size() int {
 	sz := b.Mdhd.Size()
-	sz += b.Hdlr.Size()
-	sz += b.Minf.Size()
+	if b.Hdlr != nil {
+		sz += b.Hdlr.Size()
+	}
+	if b.Minf != nil {
+		sz += b.Minf.Size()
+	}
 	return sz + BoxHeaderSize
 }
 
 func (b *MdiaBox) Dump() {
 	b.Mdhd.Dump()
-	b.Minf.Dump()
+	if b.Minf != nil {
+		b.Minf.Dump()
+	}
 }
 
 func (b *MdiaBox) Encode(w io.Writer) error {
@@ -790,7 +805,9 @@ func (b *MinfBox) Size() int {
 		sz += b.Smhd.Size()
 	}
 	sz += b.Stbl.Size()
-	sz += b.Dinf.Size()
+	if b.Dinf != nil {
+		sz += b.Dinf.Size()
+	}
 	if b.Hdlr != nil {
 		sz += b.Hdlr.Size()
 	}
@@ -963,13 +980,21 @@ func (b *StblBox) Type() string {
 
 func (b *StblBox) Size() int {
 	sz := b.Stsd.Size()
-	sz += b.Stts.Size()
+	if b.Stts != nil {
+		sz += b.Stts.Size()
+	}
 	if b.Stss != nil {
 		sz += b.Stss.Size()
 	}
-	sz += b.Stsc.Size()
-	sz += b.Stsz.Size()
-	sz += b.Stco.Size()
+	if b.Stsc != nil {
+		sz += b.Stsc.Size()
+	}
+	if b.Stsz != nil {
+		sz += b.Stsz.Size()
+	}
+	if b.Stco != nil {
+		sz += b.Stco.Size()
+	}
 	if b.Ctts != nil {
 		sz += b.Ctts.Size()
 	}
@@ -977,13 +1002,21 @@ func (b *StblBox) Size() int {
 }
 
 func (b *StblBox) Dump() {
-	b.Stsc.Dump()
-	b.Stts.Dump()
-	b.Stsz.Dump()
+	if b.Stsc != nil {
+		b.Stsc.Dump()
+	}
+	if b.Stts != nil {
+		b.Stts.Dump()
+	}
+	if b.Stsz != nil {
+		b.Stsz.Dump()
+	}
 	if b.Stss != nil {
 		b.Stss.Dump()
 	}
-	b.Stco.Dump()
+	if b.Stco != nil {
+		b.Stco.Dump()
+	}
 }
 
 func (b *StblBox) Encode(w io.Writer) error {

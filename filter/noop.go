@@ -9,7 +9,7 @@ import (
 type noopFilter struct{}
 
 // Noop() returns a filter that does nothing
-func Noop() *noopFilter {
+func Noop() Filter {
 	return &noopFilter{}
 }
 

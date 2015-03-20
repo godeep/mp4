@@ -83,7 +83,7 @@ type clipFilter struct {
 
 // Clip returns a filter that extracts a clip between begin and begin + duration (in seconds, starting at 0)
 // Il will try to include a key frame at the beginning, and keeps the same chunks as the origin media
-func Clip(begin, duration int) *clipFilter {
+func Clip(begin, duration int) Filter {
 	f := &clipFilter{begin: time.Duration(begin) * time.Second, end: time.Duration(begin+duration) * time.Second}
 	if begin < 0 {
 		f.err = ErrClipOutside

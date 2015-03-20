@@ -81,7 +81,8 @@ type clipFilter struct {
 	chunks     mdat
 }
 
-// Clip a video between begin and begin + duration (in seconds, starting at 0)
+// Clip returns a filter that extracts a clip between begin and begin + duration (in seconds, starting at 0)
+// Il will try to include a key frame at the beginning, and keeps the same chunks as the origin media
 func Clip(begin, duration int) *clipFilter {
 	f := &clipFilter{begin: time.Duration(begin) * time.Second, end: time.Duration(begin+duration) * time.Second}
 	if begin < 0 {

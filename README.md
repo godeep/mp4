@@ -5,7 +5,7 @@ For the complete MP4 specifications, see http://standards.iso.org/ittf/PubliclyA
 
 ## Doc
 
-See http://godoc.org/github.com/jfbus/mp4
+See http://godoc.org/github.com/jfbus/mp4 and http://godoc.org/github.com/jfbus/mp4/filter
 
 ## Usage
 

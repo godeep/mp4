@@ -10,11 +10,11 @@ import (
 type Filter interface {
 	// Updates the moov box
 	FilterMoov(m *mp4.MoovBox) error
-	// Filters the Mdat data
+	// Filters the Mdat data and writes it to w
 	FilterMdat(w io.Writer, m *mp4.MdatBox) error
 }
 
-// Encode video, filtering the media using a filter
+// Encode media to a writer, filtering the media using the specified filter
 func EncodeFiltered(w io.Writer, m *mp4.MP4, f Filter) error {
 	err := m.Ftyp.Encode(w)
 	if err != nil {

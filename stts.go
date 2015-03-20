@@ -58,7 +58,7 @@ func (b *SttsBox) GetTimeCode(sample, timescale uint32) time.Duration {
 	sample--
 	var units uint32
 	i := 0
-	for sample > 0 {
+	for sample > 0 && i < len(b.SampleCount) {
 		if sample >= b.SampleCount[i] {
 			units += b.SampleCount[i] * b.SampleTimeDelta[i]
 			sample -= b.SampleCount[i]

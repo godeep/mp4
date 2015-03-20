@@ -2,6 +2,15 @@ package mp4
 
 import "io"
 
+// A MPEG-4 content
+//
+// A MPEG-4 media contains three main boxes :
+//
+//   ftyp : the file type box
+//   moov : the movie box (meta-data)
+//   mdat : the media data (chunks and samples)
+//
+// Other boxes can also be present (pdin, moof, mfra, free, ...), but are not decoded.
 type MP4 struct {
 	Ftyp *FtypBox
 	Moov *MoovBox

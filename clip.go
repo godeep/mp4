@@ -280,9 +280,11 @@ func (f *clipFilter) updateChunks(tnum int, t *TrakBox) {
 			firstIndex = index
 		}
 	}
-	stsc.FirstChunk = append(stsc.FirstChunk, firstIndex)
-	stsc.SamplesPerChunk = append(stsc.SamplesPerChunk, uint32(len(firstChunk.samples)))
-	stsc.SampleDescriptionID = append(stsc.SampleDescriptionID, firstChunk.descriptionID)
+	if firstChunk != nil {
+		stsc.FirstChunk = append(stsc.FirstChunk, firstIndex)
+		stsc.SamplesPerChunk = append(stsc.SamplesPerChunk, uint32(len(firstChunk.samples)))
+		stsc.SampleDescriptionID = append(stsc.SampleDescriptionID, firstChunk.descriptionID)
+	}
 
 	// stco (chunk offsets) - build empty table to compute moov box size
 	stco := t.Mdia.Minf.Stbl.Stco

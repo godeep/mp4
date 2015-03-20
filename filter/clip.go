@@ -67,7 +67,7 @@ func (m mdat) lastSample(tnum int, timecode time.Duration) uint32 {
 		if c.track != tnum {
 			continue
 		}
-		if timecode >= c.firstTC && timecode <= c.lastTC {
+		if timecode >= c.firstTC && timecode < c.lastTC {
 			return c.lastSample
 		}
 	}
@@ -165,7 +165,7 @@ func (f *clipFilter) buildChunkList(tnum int, t *mp4.TrakBox) {
 			samples--
 		}
 		c.lastSample = uint32(ssi)
-		c.lastTC = stts.GetTimeCode(c.lastSample, timescale)
+		c.lastTC = stts.GetTimeCode(c.lastSample+1, timescale)
 		if stss != nil {
 			for ski < len(stss.SampleNumber) && stss.SampleNumber[ski] < c.lastSample {
 				c.keyFrame = true

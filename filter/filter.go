@@ -6,7 +6,6 @@ import (
 	"github.com/jfbus/mp4"
 )
 
-// A filter
 type Filter interface {
 	// Updates the moov box
 	FilterMoov(m *mp4.MoovBox) error

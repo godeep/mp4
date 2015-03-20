@@ -1,4 +1,4 @@
-package mp4
+package filter
 
 import (
 	"errors"
@@ -6,6 +6,8 @@ import (
 	"log"
 	"sort"
 	"time"
+
+	"github.com/jfbus/mp4"
 )
 
 var (
@@ -88,7 +90,7 @@ func Clip(begin, duration int) *clipFilter {
 	return f
 }
 
-func (f *clipFilter) FilterMoov(m *MoovBox) error {
+func (f *clipFilter) FilterMoov(m *mp4.MoovBox) error {
 	if f.err != nil {
 		return f.err
 	}
@@ -134,7 +136,7 @@ func (f *clipFilter) syncToKF() {
 	f.begin = tc
 }
 
-func (f *clipFilter) buildChunkList(tnum int, t *TrakBox) {
+func (f *clipFilter) buildChunkList(tnum int, t *mp4.TrakBox) {
 	stsz := t.Mdia.Minf.Stbl.Stsz
 	stsc := t.Mdia.Minf.Stbl.Stsc
 	stco := t.Mdia.Minf.Stbl.Stco
@@ -173,7 +175,7 @@ func (f *clipFilter) buildChunkList(tnum int, t *TrakBox) {
 	}
 }
 
-func (f *clipFilter) updateSamples(tnum int, t *TrakBox) {
+func (f *clipFilter) updateSamples(tnum int, t *mp4.TrakBox) {
 	// stts - sample duration
 	stts := t.Mdia.Minf.Stbl.Stts
 	oldCount, oldDelta := stts.SampleCount, stts.SampleTimeDelta
@@ -251,7 +253,7 @@ func (f *clipFilter) updateSamples(tnum int, t *TrakBox) {
 
 }
 
-func (f *clipFilter) updateChunks(tnum int, t *TrakBox) {
+func (f *clipFilter) updateChunks(tnum int, t *mp4.TrakBox) {
 	// stsc (sample to chunk) - full rebuild
 	stsc := t.Mdia.Minf.Stbl.Stsc
 	stsc.FirstChunk, stsc.SamplesPerChunk, stsc.SampleDescriptionID = []uint32{}, []uint32{}, []uint32{}
@@ -291,8 +293,8 @@ func (f *clipFilter) updateChunks(tnum int, t *TrakBox) {
 	stco.ChunkOffset = make([]uint32, index)
 }
 
-func (f *clipFilter) updateChunkOffsets(m *MoovBox, deltaOff int) uint32 {
-	stco, i := make([]*StcoBox, len(m.Trak)), make([]int, len(m.Trak))
+func (f *clipFilter) updateChunkOffsets(m *mp4.MoovBox, deltaOff int) uint32 {
+	stco, i := make([]*mp4.StcoBox, len(m.Trak)), make([]int, len(m.Trak))
 	for tnum, t := range m.Trak {
 		stco[tnum] = t.Mdia.Minf.Stbl.Stco
 	}
@@ -310,7 +312,7 @@ func (f *clipFilter) updateChunkOffsets(m *MoovBox, deltaOff int) uint32 {
 	return sz
 }
 
-func (f *clipFilter) updateDurations(m *MoovBox) {
+func (f *clipFilter) updateDurations(m *mp4.MoovBox) {
 	timescale := m.Mvhd.Timescale
 	m.Mvhd.Duration = 0
 	for tnum, t := range m.Trak {
@@ -334,12 +336,12 @@ func (f *clipFilter) updateDurations(m *MoovBox) {
 	}
 }
 
-func (f *clipFilter) FilterMdat(w io.Writer, m *MdatBox) error {
+func (f *clipFilter) FilterMdat(w io.Writer, m *mp4.MdatBox) error {
 	if f.err != nil {
 		return f.err
 	}
 	m.ContentSize = f.mdatSize
-	err := EncodeHeader(m, w)
+	err := mp4.EncodeHeader(m, w)
 	if err != nil {
 		return err
 	}
@@ -352,7 +354,7 @@ func (f *clipFilter) FilterMdat(w io.Writer, m *MdatBox) error {
 	buffer := make([]byte, bufSize)
 	for _, c := range f.chunks {
 		s := c.size()
-		n, err := io.ReadFull(m.r, buffer[:s])
+		n, err := io.ReadFull(m.Reader(), buffer[:s])
 		if err != nil {
 			return err
 		}

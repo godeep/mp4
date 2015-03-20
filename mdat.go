@@ -26,6 +26,10 @@ func (b *MdatBox) Size() int {
 	return BoxHeaderSize + int(b.ContentSize)
 }
 
+func (b *MdatBox) Reader() io.Reader {
+	return b.r
+}
+
 func (b *MdatBox) Encode(w io.Writer) error {
 	err := EncodeHeader(b, w)
 	if err != nil {

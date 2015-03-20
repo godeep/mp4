@@ -78,19 +78,3 @@ func (m *MP4) Encode(w io.Writer) error {
 	}
 	return m.Mdat.Encode(w)
 }
-
-func (m *MP4) EncodeFiltered(w io.Writer, f Filter) error {
-	err := m.Ftyp.Encode(w)
-	if err != nil {
-		return err
-	}
-	err = f.FilterMoov(m.Moov)
-	if err != nil {
-		return err
-	}
-	err = m.Moov.Encode(w)
-	if err != nil {
-		return err
-	}
-	return f.FilterMdat(w, m.Mdat)
-}

@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/jfbus/mp4"
+	"github.com/jfbus/mp4/filter"
 )
 
 func main() {
@@ -26,9 +27,9 @@ func main() {
 			fmt.Println(err)
 		}
 		if *start > 0 {
-			v.EncodeFiltered(fd, mp4.Clip(*start, *duration))
+			filter.EncodeFiltered(fd, v, filter.Clip(*start, *duration))
 		} else {
-			v.EncodeFiltered(fd, mp4.Noop())
+			filter.EncodeFiltered(fd, v, filter.Noop())
 		}
 	}
 }
